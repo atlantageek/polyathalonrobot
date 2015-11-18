@@ -519,8 +519,8 @@ void bulldozer() {
     int rdist = distance_query(R_TRIG_PIN, R_ECHO_PIN);
   Serial3.print(">" );Serial3.print( ldist);Serial3.print(",") ; Serial3.print( cdist); Serial3.print( "," ); Serial3.print( rdist);
     if (ldist > cdist && rdist > cdist) {advance(CRUISE, CRUISE ); Serial.println("straight");}
-    if (ldist < rdist) {advance(SLOW - 32, SLOW + 32); Serial3.println("left");}
-    else if (rdist < ldist) {advance(SLOW + 32, SLOW - 32);Serial3.println("right");}
+    if (ldist < rdist) {advance(0, SLOW + 32); Serial3.println("left");}
+    else if (rdist < ldist) {advance(SLOW + 32, 0);Serial3.println("right");}
  
 
     
@@ -631,13 +631,13 @@ void process_manual_commands(int incomingByte) {
     if (incomingByte == 'a') {
       left_encoder_count = 0;
       right_encoder_count = 0;
-      advance(SLOW, CRUISE);
+      advance(0, CRUISE);
       Serial3.println("Turn Left");
     }
     if (incomingByte == 'd') {
       left_encoder_count = 0;
       right_encoder_count = 0;
-      advance(CRUISE, SLOW);
+      advance(CRUISE, 0);
       Serial3.println("Turn Right");
     }
     if (incomingByte == 'w') {
