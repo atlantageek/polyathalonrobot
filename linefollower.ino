@@ -4,6 +4,13 @@
 #include <Wire.h> //I2C Arduino Library
 #include "compass.h"
 #include "MotorDriver.h"
+#include <SoftwareSerial.h>
+struct linestat {
+  double err;
+  double adj_speed;
+};
+struct linestat stats[100];
+int stat_count = 0;
 
 #define address 0x1E //0011110b, I2C 7bit address of HMC5883
 #define R_TRIG_PIN 52
@@ -39,7 +46,7 @@ int curr_right_speed = 0;
 
 int MIN_MAX = 300;
 int STOP = 0;
-int SLOW = 60;
+int SLOW = 75;
 int CRUISE = 130;
 int EMITTER = 2;
 int REAL_SLOW = 32;
@@ -51,7 +58,7 @@ char bufferX [20];
 
 
 int toggle = 0;
-float Kp = 0.005;
+float Kp = 0.07;
 float Kd = 0;
 int MAX_ADJ_SPEED = 255;
 int curr_mode = 0; //1-line, 2-remote control, 3-calibrate, 4-menu request
@@ -60,12 +67,17 @@ int dozer_target = -1;
 
 int error_found = 0;
 int prev_error_found = 0;
-int base_speed = 50;
+int base_speed = 75;
 int last_skew = 0;
 int found_max = 0;
 int straight_speed = 0;
 volatile int left_encoder_count = 0;
 volatile int right_encoder_count = 0;
+
+struct MaxIdx {
+  unsigned int idx;
+  unsigned int reading;
+};
 
 ////////////////Normalizing of Sensors
 unsigned int find_min(unsigned int readings[], int num_readings) {
@@ -88,7 +100,19 @@ unsigned int find_max(unsigned int readings[], int num_readings) {
   }
   return max_value;
 }
-
+struct MaxIdx find_max_idx(unsigned int readings[], int num_readings) {
+  int i = 0;
+  struct MaxIdx max_idx;
+  unsigned int max_value = 0;
+  for (i = 0; i < num_readings; i++) {
+    if (readings[i] > max_value) {
+      max_value = readings[i];
+      max_idx.reading = readings[i];
+      max_idx.idx = i;
+    }
+  }
+  return max_idx;
+}
 void min_adjust(unsigned int *readings, int num_readings) {
   int i = 0;
   unsigned int result[num_readings];
@@ -121,18 +145,21 @@ void normalize(unsigned int readings[], int num_readings) {
     readings[i] = (unsigned int)tmp;
   }
 }
+
 int get_error(unsigned int readings[], int num_readings) {
+  struct MaxIdx found_max = find_max_idx(readings, num_readings);
+  if (found_max.reading < 300) Serial3.println("No Max found");
+  int result = (found_max.idx * 1000) - 8000;
+  return(result);
+  
+}
+
+int get_error_orig(unsigned int readings[], int num_readings) {
   int i = 0;
   int skew = 0;
   int mul_idx;
 
   found_max = find_max(readings, num_readings);
-
-  // Serial3.print("FOUNN MAX:");
-  // Serial3.print(found_max);
-  // Serial3.println("");
-
-
 
   normalize(readings, num_readings);
 
@@ -171,39 +198,27 @@ void  backup(char left_speed, char right_speed) //Move forward
   motordriver.setSpeed(right_speed,MOTORA);
   motordriver.goBackward();
 }
-void advance(int left_speed, int right_speed) //Move forward
+void advance(char left_speed, char right_speed) //Move forward
 {
-  if (curr_left_speed == left_speed && curr_right_speed == right_speed) return;
-  if (left_speed < curr_left_speed) curr_left_speed = max((curr_left_speed - INCR), left_speed);
-  if (left_speed >= curr_left_speed) curr_left_speed = min((curr_left_speed + INCR), left_speed);
-  if (right_speed < curr_right_speed) curr_right_speed = max((curr_right_speed - INCR), right_speed);
-  if (right_speed >= curr_right_speed) curr_right_speed = min((curr_right_speed + INCR), right_speed);
-  left_speed = curr_left_speed;
-  right_speed = curr_right_speed;
-  if ( left_speed < 0 && right_speed < 0) backup(abs(left_speed), abs(right_speed));
-  else if (left_speed < 0 && right_speed >= 0) turnL(abs(left_speed),abs(right_speed));
-  else if (left_speed >= 0 && right_speed < 0) turnR(abs(left_speed), abs(right_speed));
-  else forward(abs(left_speed), abs(right_speed));
-
-  if (toggle) {
+    Serial3.print("SPEED>");
     Serial3.print(left_speed);
     Serial3.print(",");
-    Serial3.print(right_speed);
-    Serial3.println(" < SPEED");
+    Serial3.println(right_speed);
+  if (left_speed < 0) {
+    turnL(left_speed * -1, right_speed);
   }
-  motordriver.goForward();
+  else if (right_speed < 0) {
+    turnR(left_speed , right_speed * -1);
+  }
+  else {
+    forward(left_speed, right_speed);
+  }
 }
 
 void forward(unsigned char left_speed, unsigned char right_speed) //Move forward
 {
   motordriver.setSpeed(right_speed,MOTORB);
   motordriver.setSpeed(left_speed,MOTORA);
-  if (toggle) {
-    Serial3.print(left_speed);
-    Serial3.print(",");
-    Serial3.print(right_speed);
-    Serial3.println(" < SPEED");
-  }
   motordriver.goForward();
 }
 void turnR(unsigned char left_speed, unsigned char right_speed) //Move forward
@@ -361,63 +376,28 @@ void line_follow()
   prev_error_found = error_found;
   error_found = 0;
   
-  while (error_found == 0 && read_attempts < 3   ) {
   qtrrc_left.read(sensorValues);
   qtrrc_right.read(sensorValues + 8);
-    error_found = get_error(sensorValues, NUM_SENSORS * 2);
-    read_attempts += 1;
-  }
   found_max = find_max(sensorValues, NUM_SENSORS * 2);
-  if (read_attempts == 3) {
-    error_found = prev_error_found;
-  }
-  
-  else
-    last_skew = error_found;
+
+  error_found = get_error(sensorValues, NUM_SENSORS * 2);
+  Serial3.print("ERROR Found:");
+  Serial3.println(error_found);
   adj_speed = Kp * error_found + Kd * (error_found - prev_error_found);
 
 
-    if (adj_speed < -255) adj_speed = -255;
+  if (adj_speed < -255) adj_speed = -255;
   if (adj_speed > 255)  adj_speed = 255;
-  if (toggle == 1) {
-    Serial3.print("E:");
-    Serial3.print(error_found);
-    Serial3.print(",Kp:");
-    Serial3.print(Kp, 3);
-        Serial3.print(",SP:");
-    Serial3.print(base_speed);
-    Serial3.print(",ADJ:");
-    Serial3.print(adj_speed);
-    Serial3.print(",Max:");
-    Serial3.println(found_max);
+  stats[stat_count].adj_speed = adj_speed;
+  stats[stat_count].err = error_found;
+  
+  stat_count++;
+  if (stat_count > 30) {
+    line_dump();
   }
 
-  advance(base_speed + adj_speed,base_speed - adj_speed );
+  advance(adj_speed,-1 * adj_speed );
 
- /* if ((found_max < MIN_MAX) && (prev_error_found < 0)) {
-
-    lookL();
-    return;
-  }
-  else if ((found_max < MIN_MAX) && (prev_error_found > 0)) {
-
-    lookR();
-    return;
-  }
-  if (error_found < -4500) {
-    turnL(0,SLOW);
-    Serial3.println("StrongLeft");
-    return;
-  }
-  if (error_found > 4500) {
-    Serial3.println("StrongRight");
-    turnR(SLOW,0);
-  }
-  else {
-    straight_speed = 0;
-    advance(base_speed + adj_speed,base_speed - adj_speed );
-
-  }*/
 }
 
 int distance_query(int trig_pin,int echo_pin) {
@@ -471,34 +451,6 @@ int turnDistance(int astart, int aend, int dir)
   }
 }
 
-void search() {
-/*  compass_heading();
-  int start_bearing = (int)bearing;
-  int dist = 10000;
-  int target_distance = 10000;
-  int target_bearing;
-
- /* while (turnDistance(start_bearing,(int)bearing,1) < 350) {
-    turnR(CRUISE,CRUISE);
-    dist =distance_query(C_TRIG_PIN, C_ECHO_PIN);
-    if (dist < target_distance) {
-      target_distance = dist;
-      target_bearing = bearing;
-    }
-
-    compass_heading();
-  }
-  Serial3.print("TARGET BEARING:");
-  Serial3.println(target_bearing);
-  while (bearing < ((target_bearing - 10) % 360) || (bearing > ((target_bearing + 10)))) {
-    Serial3.println(bearing);
-    turnR(CRUISE,CRUISE);
-    compass_heading();
-    
-  }
-  stop();*/
-  
-}
 
 void bulldozer() {
     static int distance = 1000;
@@ -576,6 +528,16 @@ int analogPin5=5;
   }
 }
 
+void line_dump() {
+      Serial3.println(stat_count);
+    for(int i=0;i<stat_count;i++) {
+      Serial3.print(stats[i].err);
+      Serial3.print(",");
+      Serial3.println(stats[i].adj_speed);
+    }
+    stat_count=0;
+}
+
 void process_linefollow_commands(int incomingByte) {
   //INCREASE Kp
   if (incomingByte == 'P') {
@@ -620,9 +582,10 @@ void menu() {
   Serial3.println("5. Distance Query");
   Serial3.println("6. Read Calibrated Sensors"); 
   Serial3.println("7. Auto Calibrate");
-  Serial.println("8. bulldozer");
-  Serial.println("9. Get compass heading");
-  Serial.println("-. Beacon");
+  Serial3.println("8. bulldozer");
+  Serial3.println("9. Get compass heading");
+  Serial3.println("-. Beacon");
+  Serial3.println("+. compass calibrate");
   Serial3.println("t. Toggle");
   Serial3.println("Space. Menu and stop");
 }
@@ -631,19 +594,19 @@ void process_manual_commands(int incomingByte) {
     if (incomingByte == 'a') {
       left_encoder_count = 0;
       right_encoder_count = 0;
-      advance(0, CRUISE);
+      forward(0, CRUISE);
       Serial3.println("Turn Left");
     }
     if (incomingByte == 'd') {
       left_encoder_count = 0;
       right_encoder_count = 0;
-      advance(CRUISE, 0);
+      forward(CRUISE, 0);
       Serial3.println("Turn Right");
     }
     if (incomingByte == 'w') {
       left_encoder_count = 0;
       right_encoder_count = 0;
-      advance(CRUISE, CRUISE);
+      forward(SLOW, SLOW);
       Serial3.println("Straight");
     }
     if (incomingByte == 's') {
@@ -707,78 +670,87 @@ void loop()
     }
   }
 
-  if (incomingByte == '0') {
-    curr_mode = 0;
-  }
-  else if (incomingByte == '1') {
-    curr_mode = 1;
-  }
-  else if (incomingByte == '2') {
-    curr_mode = 2;
-    stop();
-    Serial3.println("You take over");
-  }
-  else if (incomingByte == '3') {
-    curr_mode = 3;
-  }
-  else if (incomingByte == '4') {
-
-    qtrrc_left.read(sensorValues);
-    qtrrc_right.read(sensorValues + 8);
-    for(int i=0;i<16;i++) {
-      Serial3.print(sensorValues[i]);
-      Serial3.print(":");
+  if (incomingByte != 0) {
+    if (incomingByte == '0') {
+      curr_mode = 0;
     }
-    get_front_sensor_info();
-
-  }
-  else if (incomingByte == '5') {
-    curr_mode = 5;
-  }
-  else if (incomingByte == '6') {
-
-    qtrrc_left.read(sensorValues);
-    qtrrc_right.read(sensorValues + 8);
-
-    for(int i=0;i<16;i++) {
-      Serial3.print(sensorValues[i]);
-      Serial3.print(",");
+    else if (incomingByte == '1') {
+      stat_count = 0;
+      curr_mode = 1;
     }
-    //int max_val = find_max(sensorValues, 16);
-    //Serial3.print("MAX:");
-    //Serial3.println(max_val);
-    
-  }
-  else if (incomingByte == '7') {
-    autocalibrate();
-  }
-  else if (incomingByte == '8') {
-    curr_mode=8;
-    Serial3.println("BULLDOZER");
-      bulldozer();
-    //search();
-  }
-  else if (incomingByte == '9') {
-    Serial3.println("compass_heading");
-    compass_heading();
-    Serial3.println(bearing);
-  }
-  else if (incomingByte == '-') {
-  curr_mode=10;
-  }
-  else if (incomingByte == ' ') {
-    menu();
-    stop();
-    curr_mode = 0;
-  }
-  else if (incomingByte == 't') {
-    if (toggle == 1) {
-      toggle = 0;
+    else if (incomingByte == '2') {
+      curr_mode = 2;
+      stop();
+      Serial3.println("You take over");
     }
-    else {
-      toggle = 1;
+    else if (incomingByte == '3') {
+      curr_mode = 3;
     }
-    Serial3.print("Toggle => ");
-    Serial3.println(toggle);
+    else if (incomingByte == '4') {
+  
+      qtrrc_left.read(sensorValues);
+      qtrrc_right.read(sensorValues + 8);
+      for(int i=0;i<16;i++) {
+        Serial3.print(sensorValues[i]);
+        Serial3.print(":");
+      }
+      get_front_sensor_info();
+  
+    }
+    else if (incomingByte == '5') {
+      curr_mode = 5;
+    }
+    else if (incomingByte == '6') {
+  
+      qtrrc_left.read(sensorValues);
+      qtrrc_right.read(sensorValues + 8);
+  
+      for(int i=0;i<16;i++) {
+        Serial3.print(sensorValues[i]);
+        Serial3.print(",");
+      }
+      //int max_val = find_max(sensorValues, 16);
+      //Serial3.print("MAX:");
+      //Serial3.println(max_val);
+      
+    }
+    else if (incomingByte == '7') {
+      autocalibrate();
+    }
+    else if (incomingByte == '8') {
+      curr_mode=8;
+      Serial3.println("BULLDOZER");
+        bulldozer();
+    }
+    else if (incomingByte == '9') {
+      Serial3.println("compass_heading");
+      compass_heading();
+      Serial3.println(bearing);
+    }
+    else if (incomingByte == '-') {
+    curr_mode=10;
+    }
+    else if (incomingByte == ' ') {
+  
+      menu();
+      stop();
+      curr_mode = 0;
+    }
+    else if (incomingByte == '+') {
+      Serial3.println("Calibrate Compass");
+      forward(30,-30);
+      compass_offset_calibration(3);
+      stop();
+    }
+    else if (incomingByte == 't') {
+      if (toggle == 1) {
+        toggle = 0;
+      }
+      else {
+        toggle = 1;
+      }
+      Serial3.print("Toggle => ");
+      Serial3.println(toggle);
+    }
   }
 }
